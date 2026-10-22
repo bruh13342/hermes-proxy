@@ -90,6 +90,153 @@ def chunk(model: str, text: str, ident: str) -> str:
     return "data: " + json.dumps(item, ensure_ascii=False) + "\n\n"
 
 
+# --------------------------------------------------------------------------- #
+# Tool-calling emulation                                                      #
+#                                                                             #
+# The upstream has no native function-calling. So when a client sends `tools`,#
+# we (1) describe them in the prompt and ask for a JSON tool-call, then       #
+# (2) parse the model's reply back into OpenAI `tool_calls`.                   #
+# --------------------------------------------------------------------------- #
+
+def tool_names(tools: Any) -> list:
+    names = []
+    for t in tools or []:
+        if isinstance(t, dict) and t.get("type") == "function":
+            fn = t.get("function", {})
+            if isinstance(fn, dict) and fn.get("name"):
+                names.append(fn["name"])
+    return names
+
+
+def build_tool_prompt(tools: Any, tool_choice: Any) -> str:
+    lines = ["You have access to the following tools (functions):", ""]
+    for t in tools or []:
+        if not isinstance(t, dict) or t.get("type") != "function":
+            continue
+        fn = t.get("function", {})
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        lines.append("- %s: %s" % (fn["name"], fn.get("description", "") or ""))
+        params = fn.get("parameters")
+        if params:
+            try:
+                lines.append("  parameters (JSON Schema): %s" % json.dumps(params))
+            except Exception:
+                pass
+    lines += [
+        "",
+        "To use tools, reply with ONLY this JSON object and nothing else "
+        "(no prose, no markdown fences):",
+        '{"tool_calls": [{"name": "<tool name>", "arguments": {<arguments object>}}]}',
+        "You may put more than one call in the array.",
+    ]
+    if isinstance(tool_choice, dict):
+        forced = (tool_choice.get("function") or {}).get("name")
+        if forced:
+            lines.append('You MUST call the tool "%s" now.' % forced)
+    elif tool_choice == "required":
+        lines.append("You MUST call at least one tool now.")
+    else:
+        lines.append("If no tool is needed, reply normally in plain text instead of JSON.")
+    return "\n".join(lines)
+
+
+def first_json_object(s: str) -> Optional[str]:
+    """Return the first balanced {...} block in s, respecting strings/escapes."""
+    start = s.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return None
+
+
+def extract_tool_calls(text: str, valid_names: set) -> Optional[list]:
+    """Parse a model reply into OpenAI tool_calls, or None if it isn't one."""
+    s = (text or "").strip()
+    if s.startswith("```"):
+        s = s.strip("`").strip()
+        if s.lower().startswith("json"):
+            s = s[4:].strip()
+    obj = None
+    try:
+        obj = json.loads(s)
+    except Exception:
+        block = first_json_object(s)
+        if block:
+            try:
+                obj = json.loads(block)
+            except Exception:
+                obj = None
+    if not isinstance(obj, dict):
+        return None
+
+    calls = obj.get("tool_calls")
+    if calls is None and isinstance(obj.get("tool_call"), dict):
+        calls = [obj["tool_call"]]
+    if calls is None and "name" in obj and "arguments" in obj:
+        calls = [obj]
+    if not isinstance(calls, list) or not calls:
+        return None
+
+    out = []
+    for c in calls:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        # only accept calls to tools the client actually offered
+        if not name or (valid_names and name not in valid_names):
+            continue
+        args = c.get("arguments", {})
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args)
+            except Exception:
+                args = "{}"
+        out.append({
+            "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+            "function": {"name": name, "arguments": args},
+        })
+    return out or None
+
+
+async def aggregate_upstream(payload: dict, up_headers: dict):
+    """Collect the full upstream answer. Returns (status_code, text)."""
+    parts = []
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("POST", UPSTREAM_URL, headers=up_headers, json=payload) as resp:
+            if resp.status_code != 200:
+                raw = await resp.aread()
+                return resp.status_code, raw.decode("utf-8", "replace")[:500]
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                if line.strip() == "data: [DONE]":
+                    break
+                text = parse_sse(line)
+                if text:
+                    parts.append(text)
+    return 200, "".join(parts)
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -117,18 +264,22 @@ async def completions(request: Request, authorization: Optional[str] = Header(de
 
     model = body.get("model") or DEFAULT_MODEL
     stream = bool(body.get("stream", False))
+    tools = body.get("tools")
+    tool_choice = body.get("tool_choice", "auto")
+    # The upstream has no native function-calling; emulate it when tools are sent.
+    tools_active = bool(tools) and tool_choice != "none"
 
     # Flatten OpenAI messages into {role, content-string} for the upstream.
     #
-    # The rusherai upstream only honors "user"/"assistant" turns: it silently
-    # ignores the "system" role, and does not understand "tool"/"function".
-    # Clients like Hermes put their agent instructions (and context) in the
-    # system prompt, so if we pass it through untouched the model drops it and
-    # behaves like a plain, context-less chatbot. So:
-    #   - collect all system/developer messages into a preamble, and
-    #   - fold that preamble into the first user turn (upstream obeys it there),
-    #   - map any non user/assistant role (tool results, etc.) to a user turn
-    #     so nothing in the conversation is silently lost.
+    # The rusherai upstream only honors "user"/"assistant" turns: it ignores the
+    # "system" role and does not understand "tool"/"function". Clients like
+    # Hermes put their agent instructions (and context) in the system prompt and
+    # carry tool calls/results in the history, so we:
+    #   - collect system/developer messages into a preamble folded into the
+    #     first user turn (the upstream obeys instructions there),
+    #   - render assistant tool_calls and tool results as text so the model can
+    #     follow the tool conversation,
+    #   - map any other role to a user turn so nothing is silently lost.
     system_preamble = []
     upstream_messages = []
     for msg in messages:
@@ -148,10 +299,31 @@ async def completions(request: Request, authorization: Optional[str] = Header(de
             if content.strip():
                 system_preamble.append(content)
             continue
-        if role not in ("user", "assistant"):
-            # tool / function results and the like: keep them visible as context
+
+        if role == "assistant":
+            calls = msg.get("tool_calls")
+            if isinstance(calls, list) and calls:
+                rendered = []
+                for call in calls:
+                    fn = call.get("function", {}) if isinstance(call, dict) else {}
+                    rendered.append("[called tool %s with arguments %s]" % (
+                        fn.get("name", ""), fn.get("arguments", "{}")))
+                content = (content + "\n" if content else "") + "\n".join(rendered)
+            upstream_messages.append({"role": "assistant", "content": content})
+            continue
+
+        if role == "tool":
+            name = msg.get("name") or msg.get("tool_call_id") or "tool"
+            upstream_messages.append({
+                "role": "user", "content": "[result from tool %s]:\n%s" % (name, content)})
+            continue
+
+        if role != "user":
             role = "user"
         upstream_messages.append({"role": role, "content": content})
+
+    if tools_active:
+        system_preamble.append(build_tool_prompt(tools, tool_choice))
 
     if system_preamble:
         preamble = "\n\n".join(system_preamble)
@@ -176,6 +348,55 @@ async def completions(request: Request, authorization: Optional[str] = Header(de
         "Accept": "text/event-stream",
     }
     ident = "chatcmpl-" + uuid.uuid4().hex
+
+    # ---- tool-calling path: aggregate, parse, return tool_calls or text ---- #
+    if tools_active:
+        status_code, full = await aggregate_upstream(payload, up_headers)
+        if status_code != 200:
+            raise HTTPException(502, f"upstream {status_code}: {full}")
+        calls = extract_tool_calls(full, set(tool_names(tools)))
+        created = int(time.time())
+
+        if stream:
+            async def tool_stream():
+                yield "data: " + json.dumps({
+                    "id": ident, "object": "chat.completion.chunk", "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                }) + "\n\n"
+                if calls:
+                    delta_calls = [{
+                        "index": i, "id": c["id"], "type": "function",
+                        "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]},
+                    } for i, c in enumerate(calls)]
+                    yield "data: " + json.dumps({
+                        "id": ident, "object": "chat.completion.chunk", "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"tool_calls": delta_calls}, "finish_reason": None}],
+                    }) + "\n\n"
+                    finish = "tool_calls"
+                else:
+                    if full:
+                        yield chunk(model, full, ident)
+                    finish = "stop"
+                yield "data: " + json.dumps({
+                    "id": ident, "object": "chat.completion.chunk", "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                }) + "\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(tool_stream(), media_type="text/event-stream")
+
+        message = {"role": "assistant", "content": None if calls else full}
+        if calls:
+            message["tool_calls"] = calls
+        return JSONResponse({
+            "id": ident, "object": "chat.completion", "created": created, "model": model,
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": "tool_calls" if calls else "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
 
     if stream:
         async def event_stream():
