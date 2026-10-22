@@ -66,6 +66,15 @@ TOKENS_PATH = CONFIG_DIR / "tokens.json"
 # ("update required"), set this to the current app version, e.g. "3.0.1".
 CLIENT_VERSION = None  # e.g. "3.0.1"
 
+# omnirush.ai sits behind Cloudflare, which blocks non-browser user-agents with
+# "Error 1010". The real app is Electron, so it sends a Chrome-like UA. We send
+# one too; without it every request is refused with HTTP 403. If you ever hit a
+# 1010/403 again, bump this to a current Chrome UA string.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+
 HTTP_TIMEOUT = 600  # seconds, generous for long generations
 
 # in-memory copy of the saved tokens: {access_token, refresh_token, gateway_url}
@@ -78,7 +87,7 @@ REFRESH_LOCK = threading.Lock()
 # --------------------------------------------------------------------------- #
 
 def _client_headers(extra=None):
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if CLIENT_VERSION:
         headers["X-OmniRush-Client"] = "gui/%s" % CLIENT_VERSION
     if extra:
