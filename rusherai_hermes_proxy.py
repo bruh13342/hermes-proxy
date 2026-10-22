@@ -119,20 +119,48 @@ async def completions(request: Request, authorization: Optional[str] = Header(de
     stream = bool(body.get("stream", False))
 
     # Flatten OpenAI messages into {role, content-string} for the upstream.
+    #
+    # The rusherai upstream only honors "user"/"assistant" turns: it silently
+    # ignores the "system" role, and does not understand "tool"/"function".
+    # Clients like Hermes put their agent instructions (and context) in the
+    # system prompt, so if we pass it through untouched the model drops it and
+    # behaves like a plain, context-less chatbot. So:
+    #   - collect all system/developer messages into a preamble, and
+    #   - fold that preamble into the first user turn (upstream obeys it there),
+    #   - map any non user/assistant role (tool results, etc.) to a user turn
+    #     so nothing in the conversation is silently lost.
+    system_preamble = []
     upstream_messages = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
+        role = msg.get("role", "user")
         content = msg.get("content")
         if isinstance(content, list):
             content = "".join(
                 part.get("text", "") for part in content
                 if isinstance(part, dict) and isinstance(part.get("text"), str)
             )
-        upstream_messages.append({
-            "role": msg.get("role", "user"),
-            "content": content if isinstance(content, str) else "",
-        })
+        if not isinstance(content, str):
+            content = ""
+
+        if role in ("system", "developer"):
+            if content.strip():
+                system_preamble.append(content)
+            continue
+        if role not in ("user", "assistant"):
+            # tool / function results and the like: keep them visible as context
+            role = "user"
+        upstream_messages.append({"role": role, "content": content})
+
+    if system_preamble:
+        preamble = "\n\n".join(system_preamble)
+        for m in upstream_messages:
+            if m["role"] == "user":
+                m["content"] = preamble + "\n\n" + m["content"]
+                break
+        else:
+            upstream_messages.insert(0, {"role": "user", "content": preamble})
 
     payload = {
         "messages": upstream_messages,
