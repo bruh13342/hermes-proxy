@@ -41,6 +41,14 @@ MODELS = [m.strip() for m in os.getenv(
 # model argue about who it is and refuse to call tools, so that one sentence is
 # dropped from the system prompt. Set PROXY_STRIP_IDENTITY=0 to keep it.
 STRIP_IDENTITY = os.getenv("PROXY_STRIP_IDENTITY", "1") != "0"
+# The upstream keeps only the newest ~20 messages and silently drops the rest
+# (measured: a fact in message 1 is seen at 19 messages, lost from 21), while
+# size barely matters (a 320k-char message is read in full). So a longer chat
+# has its older turns folded into one "earlier conversation" message, keeping
+# the request under the limit without losing them.
+MAX_UPSTREAM_MESSAGES = int(os.getenv("PROXY_MAX_MESSAGES", "16"))
+MAX_HISTORY_CHARS = int(os.getenv("PROXY_MAX_HISTORY_CHARS", "200000"))
+LOG_REQUESTS = os.getenv("PROXY_LOG", "1") != "0"
 IDENTITY_LINE = re.compile(
     r"[^.!?\n]*\b(?i:you are|you're)\b[^.!?\n]*"
     r"\b(?i:created|made|built|developed|trained|designed) by [A-Z][^.!?\n]*[.!?]?")
@@ -137,7 +145,11 @@ def build_tool_prompt(tools: Any, tool_choice: Any) -> str:
         "To use tools, reply with ONLY this JSON object and nothing else "
         "(no prose, no markdown fences):",
         '{"tool_calls": [{"name": "<tool name>", "arguments": {<arguments object>}}]}',
-        "You may put more than one call in the array.",
+        # Without this the model batches dependent steps (navigate + screenshot +
+        # send) in one reply and makes up the values it doesn't have yet.
+        "Put several calls in the array only when they don't depend on each other. If a "
+        "call needs another call's result (for example a file path it returns), make only "
+        "the earlier call now; you will get its result and can make the next call then.",
     ]
     if isinstance(tool_choice, dict):
         forced = (tool_choice.get("function") or {}).get("name")
@@ -376,6 +388,19 @@ async def completions(request: Request, authorization: Optional[str] = Header(de
             role = "user"
         upstream_messages.append({"role": role, "content": content})
 
+    packed = 0
+    if len(upstream_messages) > MAX_UPSTREAM_MESSAGES:
+        keep = MAX_UPSTREAM_MESSAGES - 1
+        older, upstream_messages = upstream_messages[:-keep], upstream_messages[-keep:]
+        packed = len(older)
+        transcript = "\n\n".join(
+            "%s: %s" % ("User" if m["role"] == "user" else "Assistant", m["content"]) for m in older)
+        if len(transcript) > MAX_HISTORY_CHARS:
+            transcript = "[...oldest messages omitted...]\n\n" + transcript[-MAX_HISTORY_CHARS:]
+        upstream_messages.insert(0, {
+            "role": "user",
+            "content": "Earlier in this conversation (oldest first):\n\n" + transcript})
+
     if system_preamble:
         preamble = "\n\n".join(system_preamble)
         for m in upstream_messages:
@@ -396,6 +421,18 @@ async def completions(request: Request, authorization: Optional[str] = Header(de
                 break
         else:
             upstream_messages.append({"role": "user", "content": tool_prompt})
+
+    if LOG_REQUESTS:
+        # counts only, never message contents
+        roles = {}
+        for msg in messages:
+            r = msg.get("role", "?") if isinstance(msg, dict) else "?"
+            roles[r] = roles.get(r, 0) + 1
+        print("[proxy] model=%s in=%d (%s) -> upstream=%d msgs, %d chars%s, tools=%d" % (
+            model, len(messages), " ".join("%s=%d" % kv for kv in sorted(roles.items())),
+            len(upstream_messages), sum(len(m["content"]) for m in upstream_messages),
+            ", %d older folded into history" % packed if packed else "",
+            len(tool_names(tools)) if tools_active else 0), flush=True)
 
     payload = {
         "messages": upstream_messages,
